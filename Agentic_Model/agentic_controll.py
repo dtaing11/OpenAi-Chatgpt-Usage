@@ -33,22 +33,25 @@ from collections import deque
 from jsonschema import Draft202012Validator
 from dotenv import load_dotenv
 from openai import OpenAI
+import re
 import hashlib
 import json
 import os
 import time
 import requests
-import random
+import argparse
 
-# NEW: Chroma (env-configurable, manual embeddings style like your snippet)
-import chromadb  # NEW
-from chromadb.config import Settings  # NEW
+# Chroma (env-configurable, manual embeddings style like your snippet)
+import chromadb  
+from chromadb.config import Settings  
 
 # Load environment variables
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
+OPENFOODFACTS_PRODUCT = "https://world.openfoodfacts.org/api/v2/product/{barcode}.json"  
+OPENFOODFACTS_SEARCH = "https://world.openfoodfacts.org/cgi/search.pl"
 
 WEATHER_CODE_TEXT = {
     0: "clear",
@@ -111,34 +114,52 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
     # STUDENT_COMPLETE --> You need to add a new tool schema for your custom tool
 }
 
+#  Add a third tool for OpenFoodFacts ----------------------------------------
+TOOL_SCHEMAS["food.lookup"] = { 
+    "type": "object",
+    "description": "Lookup OpenFoodFacts by barcode (preferred) or search by keywords.",
+    "properties": {
+        "barcode": {"type": "string", "minLength": 5},
+        "query":   {"type": "string", "minLength": 2},
+        "k":       {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}
+    },
+    "anyOf": [
+        {"required": ["barcode"]},
+        {"required": ["query"]}
+    ],
+    "additionalProperties": False
+}
+# -------------------------------------------------------------------------------
+
 # Optional hints: rough latency/cost so planner can reason about budgets. I recommend replacing the default values
 # with estimates that are accurate on measurements.
 TOOL_HINTS: Dict[str, Dict[str, Any]] = {
     "weather.get_current": {"avg_ms": 400, "avg_tokens": 50},
     "kb.search":           {"avg_ms": 120, "avg_tokens": 30},
+    "food.lookup":         {"avg_ms": 350, "avg_tokens": 30},  
 }
 
 # Controller State -----------------------------------------------------------------------------------------------------
 @dataclass
 class StepRecord:
     """Telemetry for each executed step (action)."""
-    action: str                   # tool name or 'answer'
-    args: Dict[str, Any]          # arguments supplied
-    ok: bool                      # success flag
-    latency_ms: int               # latency in milliseconds
-    info: Dict[str, Any] = field(default_factory=dict)  # normalized payload
+    action: str                   
+    args: Dict[str, Any]         
+    ok: bool                    
+    latency_ms: int              
+    info: Dict[str, Any] = field(default_factory=dict)  
 
 @dataclass
 class ControllerState:
     """Mutable task state carried through the controller loop."""
-    goal: str                     # user task/goal
-    history_summary: str = ""     # compact running summary (LLM-generated)
+    goal: str                     
+    history_summary: str = ""    
     tool_trace: List[StepRecord] = field(default_factory=list)
-    tokens_used: int = 0          # simple token accounting
-    cost_cents: float = 0.0       # simple cost accounting
-    steps_taken: int = 0          # how many actions executed
-    last_observation: str = ""    # short feedback string from last step
-    done: bool = False            # termination flag
+    tokens_used: int = 0          
+    cost_cents: float = 0.0      
+    steps_taken: int = 0          
+    last_observation: str = ""    
+    done: bool = False            
 
 
 # Budgets & Accounting -------------------------------------------------------------------------------------------------
@@ -183,6 +204,10 @@ def record_usage(s: ControllerState, usage) -> None:
 # Detect repeated (action, args) to avoid "stuck" ReAct oscillations.
 LAST_ACTIONS = deque(maxlen=3)
 
+# Deduplicate repeated identical tool calls (prevents planner loops from doing work)
+ACTION_CACHE: Dict[str, Dict[str, Any]] = {}  
+def _act_key(action: str, args: Dict[str, Any]) -> str: 
+    return hashlib.sha256(json.dumps({"a": action, "x": args}, sort_keys=True).encode()).hexdigest()
 
 def fingerprint_action(action: str, args: Dict[str, Any]) -> str:
     """
@@ -326,6 +351,11 @@ def plan_next_action(state: ControllerState) -> Tuple[str, Dict[str, Any], str]:
                 ],
                 "kb.search": [
                     {"query": "VPN policy for contractors", "k": 3}
+                ],
+                # show usage examples for the OpenFoodFacts tool
+                "food.lookup": [
+                    {"barcode": "3017620429484"},
+                    {"query": "Chobani Greek Yogurt strawberry", "k": 5}
                 ]
             }.get(name, [])
         }
@@ -368,24 +398,74 @@ def plan_next_action(state: ControllerState) -> Tuple[str, Dict[str, Any], str]:
 # Executor -------------------------------------------------------------------------------------------------------------
 
 def geocode_city(city: str) -> Optional[Dict[str, Any]]:
-    """Return {'name','lat','lon','country'} or None if not found."""
-    r = requests.get(
-        OPEN_METEO_GEOCODE,
-        params={"name": city, "count": 1, "language": "en", "format": "json"},
-        timeout=8,
-    )
-    r.raise_for_status()
-    data = r.json()
-    results = data.get("results") or []
-    if not results:
-        return None
-    top = results[0]
-    return {
-        "name": top.get("name") or city,
-        "lat": top["latitude"],
-        "lon": top["longitude"],
-        "country": top.get("country"),
-    }
+    """
+    Robust geocoder that:
+      - accepts 'lat,lon' directly with no external calls,
+      - queries Open-Meteo Geocoding with the string *as-is* (no appends),
+      - if not found, falls back to OSM Nominatim with the string *as-is*,
+      - returns {'name','lat','lon','country'} or None.
+    No hardcoded locations, states, or countries are introduced.
+    """
+    s = city.strip()
+
+    # 1) If user gave coordinates like "32.78,-79.93", use them directly.
+    m = re.match(r'^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$', s)
+    if m:
+        lat = float(m.group(1))
+        lon = float(m.group(2))
+        return {"name": f"{lat},{lon}", "lat": lat, "lon": lon, "country": None}
+
+    # 2) Try Open-Meteo Geocoder exactly as provided (no string modifications).
+    try:
+        r = requests.get(
+            OPEN_METEO_GEOCODE,
+            params={"name": s, "count": 5, "language": "en", "format": "json"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results") or []
+        if results:
+            # choose the most likely by population if present, otherwise the first
+            results.sort(key=lambda x: x.get("population") or 0, reverse=True)
+            top = results[0]
+            return {
+                "name": top.get("name") or s,
+                "lat": float(top["latitude"]),
+                "lon": float(top["longitude"]),
+                "country": top.get("country"),
+            }
+    except Exception:
+        pass 
+
+    # 3) Fallback: OSM Nominatim, exact string (no edits). Nominatim requires a User-Agent.
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": s, "format": "jsonv2", "limit": 1},
+            headers={"User-Agent": "agentic-controller/1.0"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        arr = r.json() or []
+        if arr:
+            top = arr[0]
+            name = top.get("display_name") or s
+            lat = float(top["lat"])
+            lon = float(top["lon"])
+            # country is optional in this API; keep None if not parsable
+            country = None
+            # if address blob exists, try to extract country (still not hardcoded)
+            if isinstance(top.get("address"), dict):
+                country = top["address"].get("country")
+            return {"name": name, "lat": lat, "lon": lon, "country": country}
+    except Exception:
+        pass
+
+    # Nothing found
+    return None
+
+
 
 def fetch_current_weather(lat: float, lon: float, units: str) -> Dict[str, Any]:
     """Call Open-Meteo current weather and normalize to a stable schema."""
@@ -435,23 +515,23 @@ def fetch_current_weather(lat: float, lon: float, units: str) -> Dict[str, Any]:
         "raw": cur,
     }
 
-# NEW: Chroma RAG helpers (same approach as your snippet)
-CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma")  # NEW
-CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "squad_chunks")  # NEW
-EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")  # NEW
+# Chroma RAG helpers (same approach as your snippet)
+CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma")  
+CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "squad_chunks")  
+EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")  
 
 # Keep your variable names for SQuAD compatibility
-SquaAd = os.getenv("SQUAD_DEV_FILE", "dev-v2.0.json")  # NEW
-FIVEHUNDREDQUESTION = os.getenv("FIVEHUNDREDQUESTION", "500-Question.jsonl")  # NEW
+SquaAd = os.getenv("SQUAD_DEV_FILE", "dev-v2.0.json")  
+FIVEHUNDREDQUESTION = os.getenv("FIVEHUNDREDQUESTION", "500-Question.jsonl") 
 
-def _get_chroma_client():  # NEW
+def _get_chroma_client():  
     os.makedirs(CHROMA_DIR, exist_ok=True)
     return chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(allow_reset=False))
 
-def _get_collection(client):  # NEW
+def _get_collection(client):  
     return client.get_or_create_collection(CHROMA_COLLECTION)
 
-def _oa_embed(texts: List[str]) -> List[List[float]]:  # NEW
+def _oa_embed(texts: List[str]) -> List[List[float]]:  
     oa = OpenAI()
     out: List[List[float]] = []
     B = 512
@@ -461,7 +541,7 @@ def _oa_embed(texts: List[str]) -> List[List[float]]:  # NEW
         out.extend([e.embedding for e in res])
     return out
 
-def seed_chroma_if_needed(col):  # NEW
+def seed_chroma_if_needed(col):  
     if col.count() > 0:
         return
     if not os.path.exists(SquaAd):
@@ -486,18 +566,18 @@ def seed_chroma_if_needed(col):  # NEW
     col.add(documents=docs, embeddings=embeds, ids=ids)
     print(f"[chroma] collection ready: {CHROMA_COLLECTION} (count={col.count()})")
 
-def _embed_query(q: str) -> List[float]:  # NEW
+def _embed_query(q: str) -> List[float]:  
     oa = OpenAI()
     e = oa.embeddings.create(model=EMBED_MODEL, input=q)
     return e.data[0].embedding
 
-def get_sources(col, question: str, k: int = 5) -> List[str]:  # NEW
+def get_sources(col, question: str, k: int = 5) -> List[str]: 
     qvec = _embed_query(question)
     res = col.query(query_embeddings=[qvec], n_results=k, include=["documents","ids","distances","metadatas"])
     docs = (res.get("documents") or [[]])[0]
     return docs
 
-def extractQuestion(dev):  # NEW
+def extractQuestion(dev):
     count = 0
     with open(FIVEHUNDREDQUESTION, "w", encoding="utf-8") as w:
         for art in dev["data"]:
@@ -514,6 +594,68 @@ def extractQuestion(dev):  # NEW
                     count += 1
                     if count >= 500:
                         return
+
+# OpenFoodFacts helpers ------------------------------------------------------                  
+
+def _normalize_off_product(p: Dict[str, Any]) -> Dict[str, Any]: 
+    if not p:
+        return {}
+    nutr = p.get("nutriments", {}) or {}
+    return {
+        "product_name": p.get("product_name") or p.get("product_name_en"),
+        "brands": p.get("brands"),
+        "quantity": p.get("quantity"),
+        "categories": p.get("categories"),
+        "labels": p.get("labels"),
+        "image_url": p.get("image_front_url") or p.get("image_url"),
+        "nutriments": {
+            "energy_kcal_100g": nutr.get("energy-kcal_100g"),
+            "fat_100g": nutr.get("fat_100g"),
+            "saturated_fat_100g": nutr.get("saturated-fat_100g"),
+            "carbohydrates_100g": nutr.get("carbohydrates_100g"),
+            "sugars_100g": nutr.get("sugars_100g"),
+            "fiber_100g": nutr.get("fiber_100g"),
+            "proteins_100g": nutr.get("proteins_100g"),
+            "salt_100g": nutr.get("salt_100g"),
+            "sodium_100g": nutr.get("sodium_100g"),
+        },
+        "barcode": p.get("code"),
+        "countries": p.get("countries"),
+        "quantity_unit": p.get("serving_size"),
+    }
+
+def _off_lookup_by_barcode(barcode: str) -> Tuple[bool, str, Dict[str, Any]]: 
+    r = requests.get(OPENFOODFACTS_PRODUCT.format(barcode=barcode), timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    status = data.get("status")
+    if status != 1:
+        return False, f"Barcode {barcode} not found.", {}
+    prod = _normalize_off_product(data.get("product") or {})
+    obs = f"Found product '{prod.get('product_name')}' (barcode {barcode})."
+    return True, obs, {"product": prod}
+
+def _off_search(query: str, k: int) -> Tuple[bool, str, Dict[str, Any]]: 
+    params = {
+        "search_terms": query,
+        "search_simple": 1,
+        "json": 1,
+        "action": "process",
+        "page_size": k
+    }
+    r = requests.get(OPENFOODFACTS_SEARCH, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    prods = data.get("products") or []
+    results = []
+    for p in prods:
+        results.append(_normalize_off_product(p))
+    if not results:
+        return True, "No products found.", {"results": []}
+    top = results[0]
+    obs = f"Retrieved {len(results)} products (top: {top.get('product_name')})."
+    return True, obs, {"results": results}
+# -------------------------------------------------------------------------------
 
 def execute_action(action: str, args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any], int]:
     """
@@ -579,7 +721,7 @@ def execute_action(action: str, args: Dict[str, Any]) -> Tuple[bool, str, Dict[s
                 f"wind {payload['wind_speed']} {wind_unit}"
             )
             return True, obs, payload, int((time.time() - t0) * 1000)
-        # STUDENT_COMPLETE --> you should add another tool here
+
         elif action == "kb.search":
             # Real vector search with local Chroma using manual OpenAI embeddings (style from your snippet)
             q = args["query"].strip()
@@ -621,6 +763,55 @@ def execute_action(action: str, args: Dict[str, Any]) -> Tuple[bool, str, Dict[s
             score_str = f"{top_score:.3f}" if isinstance(top_score, (int, float)) else "n/a"
             obs = f"Retrieved {len(results)} snippets (top similarity {score_str})."
             return True, obs, {"results": results}, int((time.time() - t0) * 1000)
+
+        elif action == "food.lookup":  #OpenFoodFacts tool executor
+            barcode = args.get("barcode")
+            query = args.get("query")
+            k = int(args.get("k", 5))
+
+            # Duplicate suppression (cache)
+            key = _act_key(action, args)
+            if key in ACTION_CACHE:
+                cached = ACTION_CACHE[key]
+                obs_cached = cached.get("_obs_hint") or "Using cached OpenFoodFacts result. Ready to answer."
+                return True, obs_cached, cached["payload"], int((time.time() - t0) * 1000)
+
+            if barcode:
+                ok2, obs0, payload = _off_lookup_by_barcode(barcode)
+                if not ok2:
+                    return ok2, obs0, payload, int((time.time() - t0) * 1000)
+
+                # Build a compact nutrition summary for the planner + summary
+                p = payload.get("product") or {}
+                n = p.get("nutriments") or {}
+                kcal = n.get("energy_kcal_100g")
+                fat = n.get("fat_100g")
+                carbs = n.get("carbohydrates_100g")
+                sugar = n.get("sugars_100g")
+                protein = n.get("proteins_100g")
+                salt = n.get("salt_100g")
+
+                nutline_parts = []
+                if kcal is not None:   nutline_parts.append(f"{kcal} kcal/100g")
+                if fat is not None:    nutline_parts.append(f"fat {fat}g")
+                if carbs is not None:  nutline_parts.append(f"carb {carbs}g")
+                if sugar is not None:  nutline_parts.append(f"sugar {sugar}g")
+                if protein is not None:nutline_parts.append(f"protein {protein}g")
+                if salt is not None:   nutline_parts.append(f"salt {salt}g")
+                nutline = ", ".join(nutline_parts) if nutline_parts else "nutrition data present"
+
+                # Strong observation the planner can use to stop looping
+                obs = f"{obs0} Nutrition (per 100g): {nutline}. Ready to answer."
+
+                # Cache and return
+                ACTION_CACHE[key] = {"payload": payload, "_obs_hint": obs}
+                return True, obs, payload, int((time.time() - t0) * 1000)
+
+            else:
+                ok2, obs, payload = _off_search(query.strip(), k)
+                ACTION_CACHE[key] = {"payload": payload, "_obs_hint": obs + " Ready to answer."}
+                return ok2, obs + " Ready to answer.", payload, int((time.time() - t0) * 1000)
+
         else:
             # Safety: no executor wired for this tool
             return False, f"No executor bound for tool: {action}", {}, int((time.time() - t0) * 1000)
@@ -684,7 +875,8 @@ def run_agent(goal: str) -> str:
         # Prevent infinite ReAct loops by hashing last few actions
         if looks_stuck(action, args):
             print("\tdetected being stuck in loop...")
-            state.last_observation = "Loop detected: revise plan with a different next action."
+            # Very explicit hint that the planner should switch to 'answer'
+            state.last_observation = "Loop detected: information already retrieved. Proceed to 'answer' using collected evidence."
             # Do not increment steps or execute; let planner try again
             continue
 
@@ -723,20 +915,24 @@ def run_agent(goal: str) -> str:
 
 
 # Demo -----------------------------------------------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    # STUDENT_COMPLETE --> you should use argparse here so that one can just ask a question like:
-    #         python agentic_controller.py "Why were they trying to catch the whale in Moby Dick?"
-    #         python agentic_controller.py "What is today's weather like in Baton Rouge?"
-    #         python agentic_controller.py "INSERT SOME QUERY HERE RELEVANT TO YOUR CUSTOM TOOL"
+    parser = argparse.ArgumentParser(
+        description="Run the agent with a natural language goal/query. Query for food must include barcode number, Example: What's the current weather in Paris (metric) and nutrition for Jben (barcode 6111242106949)?"
+    )
+    parser.add_argument(
+        "goal",
+        type=str,
+        help="The natural language query for the agent. Example: \"Example: What's the current weather in Paris (metric) and nutrition for Jben (barcode 6111242106949)?\""
+    )
+    args = parser.parse_args()
+    goal = args.goal 
 
-
-    # Example end-to-end run:
-    # The planner can choose to look up weather, search a KB, and then synthesize an answer.
-    goal = "What's the current weather in Paris (metric) and do I need VPN for remote access?"
     print("\n--- Running Agent ---\n")
     answer = run_agent(goal)
     print("\n--- Final Answer ---\n")
     print(answer)
+
 
     # You could also print telemetry for inspection:
     # - steps taken, tokens used, cost, brief trace, etc.
